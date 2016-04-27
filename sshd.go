@@ -2,99 +2,195 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 
-	"code.google.com/p/go.crypto/ssh"
-	"code.google.com/p/go.crypto/ssh/terminal"
+	"golang.org/x/crypto/ssh"
+	"net"
+	"errors"
+	"strings"
+	"os/exec"
+	"bytes"
+	"encoding/binary"
 )
 
-func main() {
-	// An SSH server is represented by a ServerConfig, which holds
-	// certificate details and handles authentication of ServerConns.
-	config := &ssh.ServerConfig{
-		PasswordCallback: func(conn *ssh.ServerConn, user, pass string) bool {
-			return user == "testuser" && pass == "tiger"
-		},
-	}
+const (
+	ENABLE_PASS_AUTH = false
+)
 
+var (
+	hostKeySigner ssh.Signer
+	publicKeys [][]byte
+)
+
+func init() {
 	pemBytes, err := ioutil.ReadFile("id_rsa")
 	if err != nil {
 		log.Fatal("Failed to load private key:", err)
 	}
-	if err = config.SetRSAPrivateKey(pemBytes); err != nil {
+
+	hostKeySigner, err = ssh.ParsePrivateKey(pemBytes)
+	if err != nil {
 		log.Fatal("Failed to parse private key:", err)
 	}
 
-	// Once a ServerConfig has been configured, connections can be
-	// accepted.
-	conn, err := ssh.Listen("tcp", "0.0.0.0:2022", config)
+	pemBytes, err = ioutil.ReadFile("authorized_keys")
 	if err != nil {
-		log.Fatal("failed to listen for connection")
+		log.Fatal("Failed to load authorized_key", err)
 	}
+	publicKeys = make([][]byte, 0)
 	for {
-		// A ServerConn multiplexes several channels, which must 
-		// themselves be Accepted.
-		log.Println("accept")
-		sConn, err := conn.Accept()
+		pubKey, _, _, rest, err := ssh.ParseAuthorizedKey(pemBytes)
 		if err != nil {
-			log.Println("failed to accept incoming connection")
-			continue
+			break
 		}
-		if err := sConn.Handshake(); err != nil {
-			log.Println("failed to handshake")
-			continue
-		}
-		go handleServerConn(sConn)
+		publicKeys = append(publicKeys, pubKey.Marshal())
+		pemBytes = rest
 	}
 }
 
-func handleServerConn(sConn *ssh.ServerConn) {
-	defer sConn.Close()
-	for {
-		// Accept reads from the connection, demultiplexes packets
-		// to their corresponding channels and returns when a new
-		// channel request is seen. Some goroutine must always be
-		// calling Accept; otherwise no messages will be forwarded
-		// to the channels.
-		ch, err := sConn.Accept()
-		if err == io.EOF {
-			return
+func passAuth(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+	fmt.Println("passwordcallback", pass)
+	if string(pass) == "tiger" {
+		return &ssh.Permissions{}, nil
+	}
+	return nil, errors.New("fuck you")
+}
+func pubkeyAuth(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	for _, publicKey := range publicKeys {
+		if bytes.Equal(key.Marshal(), publicKey) {
+			return nil, nil
 		}
+	}
+
+	return nil, errors.New("pubkey rejected")
+}
+
+func parseArgs(str string) (command string, args []string) {
+	commandSlice := strings.SplitN(str, " ", 2)
+	command = commandSlice[0]
+
+	argsEscapedSlice := strings.Split(commandSlice[1], "'")
+	parity := false
+
+	fmt.Println(argsEscapedSlice, strings.Join(argsEscapedSlice, ","))
+
+	for _, elem := range argsEscapedSlice {
+		if parity {
+			args = append(args, elem)
+		} else {
+			args = append(args, strings.Split(strings.TrimSpace(elem), " ")...)
+		}
+		parity = !parity
+	}
+
+	return
+}
+
+// Payload: int: command size, string: command
+func handleExec(ch ssh.Channel, req *ssh.Request) {
+
+	length := binary.BigEndian.Uint32(req.Payload)
+	fmt.Println("command length", length)
+	//todo use length subslice and range check
+
+	command := string(req.Payload[4:])
+	if strings.HasPrefix(command, "git") {
+		fmt.Println("running", command)
+
+		command, args := parseArgs(command)
+		fmt.Printf("cmd:%s args:%v\n", command, strings.Join(args, ","))
+		cmd := exec.Command(command, args...)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		err := cmd.Run()
 		if err != nil {
-			log.Println("handleServerConn Accept:", err)
-			break
+			fmt.Println("there was an error running cmd:", err.Error())
 		}
-		// Channels have a type, depending on the application level
-		// protocol intended. In the case of a shell, the type is
-		// "session" and ServerShell may be used to present a simple
-		// terminal interface.
-		if ch.ChannelType() != "session" {
-			ch.Reject(ssh.UnknownChannelType, "unknown channel type")
-			break
-		}
-		go handleChannel(ch)
+		fmt.Println("out", out.Bytes())
+
+		ch.Write(out.Bytes())
+		ch.Close()
+	} else {
+		ch.Write([]byte("command is not a GIT command\r\n"))
+		ch.Close()
+		return
 	}
 }
 
-func handleChannel(ch ssh.Channel) {
-	term := terminal.NewTerminal(ch, "> ")
-	serverTerm := &ssh.ServerTerminal{
-		Term:    term,
-		Channel: ch,
-	}
-	ch.Accept()
-	defer ch.Close()
-	for {
-		line, err := serverTerm.ReadLine()
-		if err == io.EOF {
-			return
-		}
-		if err != nil {
-			log.Println("handleChannel readLine err:", err)
+func handleChan(ch ssh.Channel, reqs <-chan *ssh.Request) {
+	for req := range reqs {
+		if req.Type == "env" {
+			ptr := req.Payload
+			//todo range check
+			length := binary.BigEndian.Uint32(ptr)
+
+			name := string(ptr[4:4+length])
+			ptr = ptr[4+length:]
+			length = binary.BigEndian.Uint32(ptr)
+
+			value := string(ptr[4:4+length])
+			fmt.Println("ENV", name, value)
 			continue
 		}
-		fmt.Println(line)
+		if req.Type != "exec" {
+			fmt.Println("skipping request", req)
+			continue
+		}
+		handleExec(ch, req)
 	}
 }
+
+func chanReq(chanReq ssh.NewChannel) {
+	if chanReq.ChannelType() != "session" {
+		chanReq.Reject(ssh.Prohibited, "channel type is not a session")
+		return
+	}
+	ch, reqs, err := chanReq.Accept()
+	if err != nil {
+		log.Fatal(err)
+	}
+	go handleChan(ch, reqs)
+}
+
+func handleSshClientConnection(sshConn *ssh.ServerConn, inChans <-chan ssh.NewChannel) {
+	defer sshConn.Close()
+	for req := range inChans {
+		go chanReq(req)
+	}
+}
+
+func main() {
+	config := &ssh.ServerConfig{
+		PublicKeyCallback: pubkeyAuth,
+	}
+	if ENABLE_PASS_AUTH {
+		config.PasswordCallback = passAuth
+	}
+
+	config.AddHostKey(hostKeySigner)
+	address := ":2022"
+	serverConn, err := net.Listen("tcp", address)
+	if err != nil {
+		log.Fatal("Could not listen on address:", address)
+		panic(err)
+	}
+	for {
+		log.Println("Accepting")
+		clientConn, err := serverConn.Accept()
+		if err != nil {
+			panic(err)
+		}
+		log.Println("Client connected from", clientConn.RemoteAddr())
+
+		sshConn, inChans, _, err := ssh.NewServerConn(clientConn, config)
+		if err != nil {
+			log.Println("Failed to create ssh connection")
+			clientConn.Close()
+			continue
+		}
+		go handleSshClientConnection(sshConn, inChans)
+	}
+}
+
